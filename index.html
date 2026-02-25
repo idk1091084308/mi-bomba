@@ -69,6 +69,9 @@
 </head>
 <body>
 
+    <!-- Load Firebase Config First -->
+    <script src="firebase-config.js"></script>
+
     <canvas id="gameCanvas"></canvas>
 
     <div id="hud" class="hidden">
@@ -163,26 +166,24 @@
         let unsubscribePlayers = null, unsubscribeRoom = null;
         
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'neon-drifter-github-build';
-        const hasFirebaseConfig = typeof __firebase_config !== 'undefined';
+        const hasFirebaseConfig = typeof window.__hasValidFirebaseConfig !== 'undefined' && window.__hasValidFirebaseConfig;
         
         if (hasFirebaseConfig) {
-            const app = initializeApp(JSON.parse(__firebase_config));
+            const app = initializeApp(window.__firebase_config);
             auth = getAuth(app);
             db = getFirestore(app);
 
             const initAuth = async () => {
                 try {
-                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } else {
-                        await signInAnonymously(auth);
-                    }
+                    await signInAnonymously(auth);
                 } catch(e) { console.error("Auth failed", e); }
             };
             initAuth();
-            onAuthStateChanged(auth, u => { user = u; });
+            onAuthStateChanged(auth, u => { user = u; if(user) console.log('✅ Firebase user:', user.uid); });
         } else {
-            console.warn("No Firebase config detected. Running in Singleplayer only mode for GitHub Pages.");
+            console.warn("⚠️ No Firebase config detected. Multiplayer will use WebSocket server.");
+            // Create dummy user for WebSocket mode
+            user = { uid: 'player_' + Math.random().toString(36).substring(2, 9) };
         }
 
         // --- MAP DATA & IMAGES ---
