@@ -152,43 +152,38 @@
         </div>
     </div>
 
-    <!-- Socket.IO Client for WebSocket Multiplayer -->
-    <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
-
+    <!-- Firebase SDKs -->
     <script type="module">
-        // --- BACKEND CONNECTION SETUP ---
-        let socket = null;
-        let currentRoomId = null, isHost = false;
-        let user = { uid: 'player_' + Math.random().toString(36).substring(2, 9) };
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, query, onSnapshot, deleteDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- FIREBASE SETUP & GITHUB FALLBACK ---
+        let db, auth, user, currentRoomId = null, isHost = false;
+        let unsubscribePlayers = null, unsubscribeRoom = null;
         
-        const USE_WEBSOCKET = true; // Set to true for WebSocket/Socket.IO multiplayer
-        const WEBSOCKET_URL = window.location.origin.includes('localhost') 
-            ? 'http://localhost:3000' 
-            : window.location.origin;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'neon-drifter-github-build';
+        const hasFirebaseConfig = typeof __firebase_config !== 'undefined';
+        
+        if (hasFirebaseConfig) {
+            const app = initializeApp(JSON.parse(__firebase_config));
+            auth = getAuth(app);
+            db = getFirestore(app);
 
-        // Initialize WebSocket connection
-        if (USE_WEBSOCKET) {
-            socket = io(WEBSOCKET_URL, {
-                reconnection: true,
-                reconnectionDelay: 1000,
-                reconnectionDelayMax: 5000,
-                reconnectionAttempts: 5
-            });
-
-            socket.on('connect', () => {
-                console.log('Connected to game server:', socket.id);
-            });
-
-            socket.on('connect_error', (error) => {
-                console.error('Connection error:', error);
-            });
-
-            socket.on('disconnect', () => {
-                console.log('Disconnected from server');
-            });
+            const initAuth = async () => {
+                try {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch(e) { console.error("Auth failed", e); }
+            };
+            initAuth();
+            onAuthStateChanged(auth, u => { user = u; });
+        } else {
+            console.warn("No Firebase config detected. Running in Singleplayer only mode for GitHub Pages.");
         }
-
-        const hasFirebaseConfig = false; // Disabled - using WebSocket instead
 
         // --- MAP DATA & IMAGES ---
         const mapImages = [
@@ -813,21 +808,24 @@
             requestAnimationFrame(loop);
         }
 
-        // --- WEBSOCKET MULTIPLAYER LOGIC ---
+        // --- FIREBASE MULTIPLAYER LOGIC ---
+        function getCollectionPath(type) {
+            if(!user) return null;
+            return type === 'rooms' 
+                ? collection(db, 'artifacts', appId, 'public', 'data', 'rooms')
+                : collection(db, 'artifacts', appId, 'public', 'data', 'rooms', currentRoomId, 'players');
+        }
+
         async function createRoom() {
-            if(!socket) return alert("Connecting...");
-            socket.emit('createRoom', {
-                name: document.getElementById('playerName').value || 'Racer',
-                color: document.getElementById('carColor').value,
-                hat: document.getElementById('carHat').value,
-                mapVote: parseInt(document.getElementById('mapVote').value)
-            }, (response) => {
-                if (response.success) {
-                    joinRoomLogic(response.roomCode);
-                } else {
-                    alert('Failed to create room');
-                }
-            });
+            if(!user) return alert("Waiting for connection...");
+            const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+            currentRoomId = roomCode;
+            isHost = true;
+
+            const roomRef = doc(getCollectionPath('rooms'), roomCode);
+            await setDoc(roomRef, { state: 'LOBBY', mapVote: parseInt(document.getElementById('mapVote').value), createdAt: Date.now() });
+
+            joinRoomLogic(roomCode);
         }
 
         async function joinRoomBtn() {
@@ -836,106 +834,86 @@
         }
 
         async function joinRoomLogic(code) {
-            if(!socket) return;
+            if(!user) return;
             currentRoomId = code;
             
             document.getElementById('ui-multiplayer').classList.add('hidden');
             document.getElementById('ui-lobby').classList.remove('hidden');
             document.getElementById('lobbyRoomCode').innerText = code;
-            document.getElementById('btnStartGame').classList.add('hidden');
-            document.getElementById('waitingMsg').classList.remove('hidden');
 
-            // For WebSocket, only host can start
-            socket.emit('joinRoom', {
-                roomCode: code,
-                name: document.getElementById('playerName').value || 'Racer',
-                color: document.getElementById('carColor').value,
-                hat: document.getElementById('carHat').value,
-                mapVote: parseInt(document.getElementById('mapVote').value)
-            }, (response) => {
-                if (!response.success) {
-                    alert(response.error || 'Failed to join room');
-                    backToMain();
+            if(isHost) document.getElementById('btnStartGame').classList.remove('hidden');
+            else document.getElementById('waitingMsg').classList.remove('hidden');
+
+            const name = document.getElementById('playerName').value || 'Racer';
+            const color = document.getElementById('carColor').value;
+            const hat = document.getElementById('carHat').value;
+            const mapVote = parseInt(document.getElementById('mapVote').value);
+
+            const playerRef = doc(getCollectionPath('players'), user.uid);
+            await setDoc(playerRef, { name, color, hat, mapVote, x:0, y:0, angle:0, ready: true });
+
+            const roomRef = doc(getCollectionPath('rooms'), code);
+            unsubscribeRoom = onSnapshot(roomRef, (snap) => {
+                if(!snap.exists()) return backToMain();
+                const data = snap.data();
+                if(data.state === 'PLAYING' && gameState !== 'PLAYING') {
+                    currentMapIndex = data.mapIndex;
+                    startGameReal();
                 }
-            });
+            }, e => console.error("Room Sync Error", e));
 
-            // Listen for room state updates
-            socket.off('roomState');
-            socket.on('roomState', (data) => {
-                if (data.code !== currentRoomId) return;
-                
+            unsubscribePlayers = onSnapshot(getCollectionPath('players'), (snap) => {
                 const list = document.getElementById('playerList');
                 list.innerHTML = '';
-                document.getElementById('playerCount').innerText = data.players.length;
+                document.getElementById('playerCount').innerText = snap.size;
                 
                 let votes = [];
-                data.players.forEach(p => {
-                    const li = document.createElement('li');
-                    li.innerText = `${p.name} ${p.id === socket.id ? '(You)' : ''}`;
-                    li.style.color = p.color;
-                    list.appendChild(li);
-                    votes.push(p.mapVote);
 
-                    if (gameState === 'PLAYING' && p.id !== socket.id) {
-                        if(!players[p.id]) players[p.id] = new Car(p.id, false, p.name, p.color, p.hat);
+                snap.forEach(docSnap => {
+                    const d = docSnap.data();
+                    const pid = docSnap.id;
+                    
+                    const li = document.createElement('li');
+                    li.innerText = `${d.name} ${pid===user.uid ? '(You)' : ''}`;
+                    li.style.color = d.color;
+                    list.appendChild(li);
+
+                    votes.push(d.mapVote);
+
+                    if (gameState === 'PLAYING' && pid !== user.uid) {
+                        if(!players[pid]) players[pid] = new Car(pid, false, d.name, d.color, d.hat);
+                        players[pid].targetX = d.x;
+                        players[pid].targetY = d.y;
+                        players[pid].targetAngle = d.angle;
+                        players[pid].lap = d.lap || 1;
                     }
                 });
 
-                // First player to join becomes host
-                if (data.players[0]?.id === socket.id) {
-                    isHost = true;
-                    document.getElementById('btnStartGame').classList.remove('hidden');
-                    document.getElementById('waitingMsg').classList.add('hidden');
-                }
-            });
-
-            // Listen for game start
-            socket.off('gameStart');
-            socket.on('gameStart', (data) => {
-                if (gameState !== 'PLAYING') {
-                    currentMapIndex = data.mapIndex;
-                    gameMode = 'MULTI';
-                    startGameReal();
-                }
-            });
-
-            // Listen for player updates
-            socket.off('playerUpdate');
-            socket.on('playerUpdate', (data) => {
-                if (gameState === 'PLAYING' && data.id !== socket.id) {
-                    if (players[data.id]) {
-                        players[data.id].targetX = data.x;
-                        players[data.id].targetY = data.y;
-                        players[data.id].targetAngle = data.angle;
-                        players[data.id].lap = data.lap;
+                Object.keys(players).forEach(pid => {
+                    if(!snap.docs.find(d => d.id === pid) && pid !== localPlayerId && !players[pid].isBot) {
+                        delete players[pid];
                     }
-                }
-            });
+                });
 
-            // Listen for map vote updates
-            socket.off('mapVoteUpdate');
-            socket.on('mapVoteUpdate', (data) => {
-                currentMapIndex = data.mapIndex;
-            });
+                if(isHost && gameState === 'LOBBY') {
+                    let finalMap = votes[0];
+                    if(!votes.every(v => v === votes[0])) {
+                        finalMap = votes[Math.floor(Math.random() * votes.length)];
+                    }
+                    updateDoc(roomRef, { mapIndex: finalMap });
+                }
+
+            }, e => console.error("Player Sync Error", e));
 
             document.getElementById('mapVote').onchange = (e) => {
-                socket.emit('updateMapVote', { mapVote: parseInt(e.target.value) });
+                updateDoc(playerRef, { mapVote: parseInt(e.target.value) });
             };
         }
 
         async function hostStartGame() {
-            if(!isHost || !socket) return;
-            socket.emit('startGame', {}, (response) => {
-                if (response.success) {
-                    currentMapIndex = 3; // Will be updated by server
-                    gameMode = 'MULTI';
-                }
-            });
-        }
-
-        function getCollectionPath(type) {
-            // Not used with WebSocket, but kept for compatibility
-            return null;
+            if(!isHost || !user) return;
+            const roomRef = doc(getCollectionPath('rooms'), currentRoomId);
+            await updateDoc(roomRef, { state: 'PLAYING' });
         }
 
         function startGameReal() {
@@ -977,14 +955,10 @@
 
             if(gameMode === 'MULTI') {
                 setInterval(() => {
-                    if(gameState === 'PLAYING' && socket) {
+                    if(gameState === 'PLAYING' && user) {
                         const p = players[localPlayerId];
-                        socket.emit('updatePlayer', { 
-                            x: p.x, 
-                            y: p.y, 
-                            angle: p.angle, 
-                            lap: p.lap
-                        });
+                        const playerRef = doc(getCollectionPath('players'), user.uid);
+                        setDoc(playerRef, { x: p.x, y: p.y, angle: p.angle, lap: p.lap }, {merge:true});
                     }
                 }, 100); 
             }
@@ -1001,8 +975,10 @@
 
         async function backToMain() {
             gameState = 'MENU';
-            if(socket && currentRoomId) {
-                socket.emit('leaveRoom');
+            if(unsubscribePlayers) unsubscribePlayers();
+            if(unsubscribeRoom) unsubscribeRoom();
+            if(user && currentRoomId) {
+                try { await deleteDoc(doc(getCollectionPath('players'), user.uid)); } catch(e){}
             }
             currentRoomId = null; isHost = false;
             document.querySelectorAll('.ui-layer').forEach(el => el.classList.add('hidden'));
@@ -1033,7 +1009,7 @@
         };
 
         document.getElementById('btnMultiplayer').onclick = () => {
-            if(!socket || socket.disconnected) return alert("Game server is offline. Please start the Node.js server first: npm install && npm start");
+            if(!hasFirebaseConfig) return alert("Multiplayer requires Firebase config. Playing on Github? You need your own DB config. Try Singleplayer!");
             document.getElementById('ui-main').classList.add('hidden');
             document.getElementById('ui-multiplayer').classList.remove('hidden');
             gameMode = 'MULTI';
